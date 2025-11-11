@@ -53,7 +53,10 @@ def parse_motion(content):
         "type": "Paragraph",
         "children": [{
             "type": "RawText",
-            "content": f"{{{{Motion|{mover}|{motion_text}|{seconder}|{outcome_detail}}}}}"
+            "content": (
+                f"'''Motion&#58;''' {mover} moved that the EMS Board of Directors shall: {motion_text}."
+                f"<br>Seconded by {seconder}. '''Motion {passfail.lower()}''', {outcome_detail}."
+            )
         }]
     }
     return template_node
