@@ -29,25 +29,32 @@ def process_keywords(textw):
         result = parse_action(content)
     return result
 
-def split_namevalue(content):
-    pattern = r"[:,\.]"
-    logmsg(f"split_namevalue, content: {content}")
-
-    name, *rest = [p.strip() for p in re.split(pattern, content)]
-    value = rest[0] if rest else ""
-    return [name, value]
+# Motion grammar (keyword-anchored, NOT period-positional):
+#   <mover>, <motion text>. Seconded: <seconder>. <result>: <outcome>.
+# The motion text is matched non-greedily up to "Seconded:", so it may contain
+# any number of sentences/periods/commas without shifting the other fields.
+MOTION_RE = re.compile(
+    r"^\s*(?P<mover>[^,]+?)\s*,\s*(?P<text>.+?)\s*\.?\s*"
+    r"Seconded\s*:?\s*(?P<seconder>.+?)\s*\.?\s*"
+    r"(?P<result>Passes|Fails|Carried|Tabled|Withdrawn|Defeated)\b\s*:?\s*"
+    r"(?P<outcome>.+?)\s*\.?\s*$",
+    re.IGNORECASE,
+)
 
 def parse_motion(content):
-    # input is something like: 
-    # Sam, Approve the agenda as presented. Seconded: Andrew. Passes, approved unanimously.
-    # First split into sentences (name/value pairs)
-    results = [p.strip() for p in content.split(".", maxsplit=3)]
-    logmsg(f"got results: {len(results)}")
-    motion_part, second_part, outcome_part, *rest = results
+    # input is something like:
+    # Sam, Approve the agenda as presented. Seconded: Andrew. Passes: approved unanimously.
+    match = MOTION_RE.match(content)
+    if not match:
+        logmsg(f"WARNING: could not parse @motion, leaving raw text in place: {content!r}")
+        return None
 
-    mover, motion_text = split_namevalue(motion_part)
-    _, seconder = split_namevalue(second_part)
-    passfail, outcome_detail = split_namevalue(outcome_part)
+    mover = match.group("mover").strip()
+    motion_text = match.group("text").strip().rstrip(".").strip()
+    seconder = match.group("seconder").strip()
+    result = match.group("result").strip().lower()
+    outcome = match.group("outcome").strip().rstrip(".").strip()
+    logmsg(f"Parsed motion: mover={mover!r} second={seconder!r} result={result!r} outcome={outcome!r}")
 
     template_node = {
         "type": "Paragraph",
@@ -55,24 +62,35 @@ def parse_motion(content):
             "type": "RawText",
             "content": (
                 f"'''Motion&#58;''' {mover} moved that the EMS Board of Directors shall: {motion_text}."
-                f"<br>Seconded by {seconder}. '''Motion {passfail.lower()}''', {outcome_detail}."
+                f"<br>Seconded by {seconder}. '''Motion {result}''', {outcome}."
             )
         }]
     }
     return template_node
 
 def parse_action(content):
+    # input is something like:  Thomas, figure out a cost structure for workshops
+    # Authors write "Name, action"; older usage was "Name action". Prefer the
+    # comma split so a trailing comma never gets stuck onto the name.
+    content = content.strip()
+    if "," in content:
+        name, action = content.split(",", 1)
+    else:
+        name, _, action = content.partition(" ")
+    name = name.strip().rstrip(".,").strip()
+    action = action.strip()
 
-    name, *rest = content.split(maxsplit=1)
-    action = rest[0] if rest else ""
-
+    # the @action wiki macro expands to "{name} will {action}", so trim a
+    # leading "will"/"to" to avoid "Sam will will open a PO Box".
     words = action.split(maxsplit=1)
     if words and words[0].lower() in ["will", "to"]:
         action = words[1] if len(words) > 1 else ''
 
-    # the @action wiki macro expands to {name} will {action}
-    # so we trim off words like "will", "to"
-    # {{action|Sam|will open a PO Box for the maker space.}}
+    if not name or not action:
+        logmsg(f"WARNING: could not parse @action, leaving raw text in place: {content!r}")
+        return None
+
+    logmsg(f"Parsed action: name={name!r} action={action!r}")
     template_node = {
         "type": "Paragraph",
         "children": [{
@@ -82,15 +100,31 @@ def parse_action(content):
     }
     return template_node
 
+def flatten_text(node):
+    """Recursively collect all text in a node, including the content of
+    EscapeSequence tokens (e.g. Google Docs exports a leading bullet as "\\-")."""
+    if node.get("type") == "RawText":
+        return node.get("content", "")
+    return "".join(flatten_text(c) for c in node.get("children", []) or [])
+
 def process_ast(ast):
     """Recursively transform the AST"""
     new_children = []
     for node in ast["children"]:
         if node["type"] == "Paragraph":
-            para_text = "".join([c["content"] for c in node["children"] if c["type"] == "RawText"])
-            result_node = process_keywords(para_text)
+            full_text = flatten_text(node).strip()
+            # A keyword line authored as a bullet may arrive as a paragraph when
+            # Google Docs escapes the marker ("\- @action ..."). Detect a leading
+            # "-"/"*" marker so we can re-bullet the result.
+            marker_match = re.match(r"^[-*]\s+(.*)$", full_text, re.DOTALL)
+            keyword_text = marker_match.group(1) if marker_match else full_text
+            result_node = process_keywords(keyword_text)
             if result_node:
-                logmsg(f"get extracted keyword ast node, text: {para_text}")
+                logmsg(f"get extracted keyword ast node, text: {keyword_text}")
+                if marker_match:
+                    # originated from a (possibly escaped) bullet -> emit a list item
+                    result_node = {"type": "List", "children": [
+                        {"type": "ListItem", "children": [result_node]}]}
                 new_children.append(result_node)
             else:
                 new_children.append(node)
@@ -105,11 +139,15 @@ def examine_ast(ast):
   logmsg(json.dumps(ast, indent=2))  
 
 def render_markdown_document(ast):
-    lines = []
+    # Separate top-level blocks with a blank line. MediaWiki only starts a new
+    # paragraph on a blank line, so single-newline-joined blocks would otherwise
+    # collapse into one paragraph (lost line breaks between prose/quotes/etc).
+    blocks = []
     for node in ast["children"]:
-        lines.append(render_markdown_node(node, 0))
-
-    return "\n".join(lines)
+        rendered = render_markdown_node(node, 0).rstrip("\n")
+        if rendered:
+            blocks.append(rendered)
+    return "\n\n".join(blocks) + "\n"
 
 def render_markdown_node(node, indent_level=0):
     indent = '  ' * indent_level  # 2 spaces per level
@@ -133,15 +171,32 @@ def render_markdown_node(node, indent_level=0):
         node_str += ''.join(render_markdown_node(item, indent_level) for item in node["children"])
         return node_str
     elif node["type"] == "ListItem":
-        item_content = ''.join(render_markdown_node(child, indent_level + 1) for child in node["children"])
-        # Handle multi-paragraph list items or nested lists
+        # Join block children with a single newline (never a blank line, which
+        # would break the list), so consecutive loose paragraphs don't glue
+        # together (e.g. "...x9Only two members..."). Nested lists already
+        # carry their own leading newline.
+        item_content = ""
+        for child in node["children"]:
+            piece = render_markdown_node(child, indent_level + 1)
+            if not piece:
+                continue
+            if item_content and not item_content.endswith("\n") and not piece.startswith("\n"):
+                item_content += "\n"
+            item_content += piece
+        if not item_content.strip():
+            return ""  # drop empty bullets (e.g. a stray "* " in the source)
+        # Handle multi-paragraph list items or nested lists. Ensure the item
+        # ends in a newline so a trailing loose paragraph can't glue the next
+        # sibling bullet onto it (e.g. "...platform fees* Member Matters:").
         if '\n' in item_content.strip():
+            if not item_content.endswith("\n"):
+                item_content += "\n"
             return f"*{'*' * indent_level} {item_content}"
         return f"*{'*' * indent_level} {item_content.strip()}\n"
     elif node["type"] == "Strong":
-        return f"**{content}**"
+        return f"'''{content}'''"
     elif node["type"] == "Emphasis":
-        return f"*{content}*"
+        return f"''{content}''"
     elif node["type"] == "InlineCode":
         return f"`{content}`"
     elif node["type"] == "CodeFence":
@@ -191,6 +246,24 @@ def convert_file(input_file):
       new_markdown = render_markdown_document(modified_ast)
       return new_markdown
 
+def lint_output(text):
+    """Scan the generated wikitext for things that usually mean a transform
+    was missed. Returns a list of human-readable issue strings."""
+    issues = []
+    for i, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if re.search(r"\*\*[^*\s].*?\*\*", line):
+            issues.append(f"line {i}: leftover markdown bold (**...**) — should be '''...''': {stripped}")
+        if re.search(r"(?<!\!)\[[^\]]+\]\([^)]+\)", line):
+            issues.append(f"line {i}: leftover markdown link [text](url): {stripped}")
+        if re.fullmatch(r"\*+", stripped):
+            issues.append(f"line {i}: empty list item")
+        if re.search(r"[^\s*]\*+\s", line):
+            issues.append(f"line {i}: possible bullet glued to preceding text: {stripped}")
+        if re.search(r"@(motion|action)\b", line, re.IGNORECASE):
+            issues.append(f"line {i}: unconverted @keyword (parse failed?): {stripped}")
+    return issues
+
 # Run the conversion
 def main():
     if len(sys.argv) < 2:
@@ -199,6 +272,14 @@ def main():
     infile = sys.argv[1]
     output = convert_file(infile)
     print(output)
+
+    issues = lint_output(output)
+    if issues:
+        logmsg(f"\nLINT: {len(issues)} issue(s) found in output — review before pasting to the wiki:")
+        for issue in issues:
+            logmsg(f"  - {issue}")
+    else:
+        logmsg("\nLINT: no issues found.")
 
 if __name__ == "__main__":
     main()
